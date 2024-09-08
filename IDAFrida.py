@@ -1,6 +1,6 @@
 import ida_name
 import idaapi
-
+import ida_kernwin
 
 ###################
 # from: https://github.com/igogo-x86/HexRaysPyTools
@@ -64,48 +64,97 @@ from PyQt5.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QTextEdit
 
 default_template = """
 
-(function () {
+const MODULE_NAME="[filename]";
+let isFoudModule = false;
+let isHooked = false;
 
-    // @ts-ignore
-    function print_arg(addr) {
-        try {
-            var module = Process.findRangeByAddress(addr);
-            if (module != null) return "\\n"+hexdump(addr) + "\\n";
-            return ptr(addr) + "\\n";
-        } catch (e) {
-            return addr + "\\n";
-        }
+ // @ts-ignore
+function print_arg(addr) {
+    try {
+        var module = Process.findRangeByAddress(addr);
+        if (module != null) return "\\n"+hexdump(addr) + "\\n";
+        return ptr(addr) + "\\n";
+    } catch (e) {
+        return addr + "\\n";
     }
+}
 
-    // @ts-ignore
-    function hook_native_addr(funcPtr, paramsNum) {
-        var module = Process.findModuleByAddress(funcPtr);
-        try {
-            Interceptor.attach(funcPtr, {
-                onEnter: function (args) {
-                    this.logs = "";
-                    this.params = [];
-                    // @ts-ignore
-                    this.logs=this.logs.concat("So: " + module.name + "  Method: [funcname] offset: " + ptr(funcPtr).sub(module.base) + "\\n");
-                    for (let i = 0; i < paramsNum; i++) {
-                        this.params.push(args[i]);
-                        this.logs=this.logs.concat("this.args" + i + " onEnter: " + print_arg(args[i]));
-                    }
-                }, onLeave: function (retval) {
-                    for (let i = 0; i < paramsNum; i++) {
-                        this.logs=this.logs.concat("this.args" + i + " onLeave: " + print_arg(this.params[i]));
-                    }
-                    this.logs=this.logs.concat("retval onLeave: " + print_arg(retval) + "\\n");
-                    console.log(this.logs);
+// @ts-ignore
+function hook_native_addr(module, offset, funcName, paramsNum) {
+    try {
+        const funcPtr = module.base.add(offset);
+        console.log("offset:", offset)
+        console.log("funcPtr:", funcPtr);
+        console.log("funcName:", funcName);
+        console.log("paramsNum:", paramsNum);
+
+        Interceptor.attach(funcPtr, {
+            onEnter: function (args) {
+                this.logs = "";
+                this.params = [];
+                // @ts-ignore
+                this.logs=this.logs.concat("So: " + module.name + "  Method: " + funcName + " offset: " + offset + "\\n");
+                for (let i = 0; i < paramsNum; i++) {
+                    this.params.push(args[i]);
+                    this.logs=this.logs.concat("this.args" + i + " onEnter: " + print_arg(args[i]));
                 }
-            });
-        } catch (e) {
-            console.log(e);
-        }
+            }, onLeave: function (retval) {
+                for (let i = 0; i < paramsNum; i++) {
+                    this.logs=this.logs.concat("this.args" + i + " onLeave: " + print_arg(this.params[i]));
+                }
+                this.logs=this.logs.concat("retval onLeave: " + print_arg(retval) + "\\n");
+                console.log(this.logs);
+            }
+        });
+    } catch (e) {
+        console.log(e);
     }
-    // @ts-ignore
-    hook_native_addr(Module.findBaseAddress("[filename]").add([offset]), [nargs]);
-})();
+}
+
+//hook_dlopen
+function hook_dlopen(dlopenPtr) {
+    Interceptor.attach(dlopenPtr, {
+        onEnter: function (args) {
+            if (args[0].isNull()) return
+
+            let moduleFullPath = args[0].readCString()
+            console.log('dlopen:', moduleFullPath);
+            
+            if(moduleFullPath == MODULE_NAME || moduleFullPath.includes(MODULE_NAME) &&
+                !isFoudModule){
+                isFoudModule = true;
+                console.warn("foud targe module:", moduleFullPath);
+            }
+
+        },
+        onLeave: function (retval) {
+            
+            console.warn("isFoudModule=" + isFoudModule + " isHooked=" + isHooked);
+            if(isFoudModule && !isHooked){
+                isHooked = true;
+
+                var m = Process.findModuleByName(MODULE_NAME); 
+                console.error("module: " + m.name + ", addr: "+ m.base + ", size: " + m.size + ", path: " + m.path);
+                
+                // hook native function append here 
+                // append new hook...
+                hook_native_addr(m, ptr([offset]), "[funcname]", 0x1);
+            }
+        },
+    })
+}
+
+// start 
+setImmediate(function() {
+    let dlopenPtr = Module.findExportByName('libdl.so', 'dlopen')
+    console.log('dlopen', dlopenPtr);
+
+    let dlopenExPtr = Module.findExportByName('libdl.so', 'android_dlopen_ext')
+    console.log('dlopenExPtr', dlopenExPtr);
+
+    hook_dlopen(dlopenPtr)
+    hook_dlopen(dlopenExPtr);
+});
 
 """
 
@@ -228,7 +277,19 @@ class ScriptGenerator:
             print(e)
             return False
         try:
-            QApplication.clipboard().setText(data)
+            
+            clipboard_data = ""
+            for func_addr in func_addr_list:
+                dec_func = idaapi.decompile(func_addr)
+
+                filename = self.get_function_name(func_addr)
+                funcname =  self.get_function_name(func_addr)
+                offset = hex(func_addr - self.imagebase)
+                nargs = hex(dec_func.type.get_nargs())
+                repdata =f"hook_native_addr(m, {offset}, \"{funcname}\", {nargs});\n"
+                clipboard_data += repdata
+
+            QApplication.clipboard().setText(clipboard_data)
             print("The generated Frida script has been copied to the clipboard!")
         except Exception as e:
             print(e)
@@ -251,7 +312,7 @@ class IDAFridaMenuAction(Action):
         raise NotImplemented
 
     def update(self, ctx) -> None:
-        if ctx.form_type == idaapi.BWN_FUNCS or ctx.form_type==idaapi.BWN_PSEUDOCODE or ctx.form_type==idaapi.BWN_DISASM:
+        if ctx.widget_type == idaapi.BWN_FUNCS or ctx.widget_type==idaapi.BWN_PSEUDOCODE or ctx.widget_type==idaapi.BWN_DISASM:
             idaapi.attach_action_to_popup(ctx.widget, None, self.name, self.TopDescription + "/")
             return idaapi.AST_ENABLE_FOR_WIDGET
         return idaapi.AST_DISABLE_FOR_WIDGET
@@ -267,7 +328,7 @@ class GenerateFridaHookScript(IDAFridaMenuAction):
         gen = ScriptGenerator(global_config)
         idb_path = os.path.dirname(idaapi.get_input_file_path())
         out_file = os.path.join(idb_path, "IDAhook.js")
-        if ctx.form_type==idaapi.BWN_FUNCS:
+        if ctx.widget_type==idaapi.BWN_FUNCS:
             selected = [idaapi.getn_func(idx).start_ea for idx in ctx.chooser_selection] #from "idaapi.getn_func(idx - 1)" to "idaapi.getn_func(idx)"
         else:
             selected=[idaapi.get_func(idaapi.get_screen_ea()).start_ea]
